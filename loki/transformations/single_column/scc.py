@@ -18,6 +18,7 @@ from loki.transformations.temporaries import (
 from loki.transformations.single_column.base import SCCBaseTransformation
 from loki.transformations.single_column.annotate import SCCAnnotateTransformation
 from loki.transformations.single_column.collapse import SCCCollapseTransformation
+from loki.transformations.single_column.split import SCCSplitDriverLoopsTransformation
 from loki.transformations.single_column.demote import SCCDemoteTransformation
 from loki.transformations.single_column.hoist import SCCHoistTemporaryArraysTransformation
 from loki.transformations.single_column.devector import SCCDevectorTransformation
@@ -132,6 +133,7 @@ SCCSVectorPipeline = partial(
         SCCDemoteTransformation,
         SCCSeqRevectorTransformation,
         SCCAnnotateTransformation,
+        SCCSplitDriverLoopsTransformation,
         SCCCollapseTransformation,
         PragmaModelTransformation
     )
@@ -252,6 +254,7 @@ SCCSHoistPipeline = partial(
         HoistTemporaryArraysAnalysis,
         SCCHoistTemporaryArraysTransformation,
         SCCAnnotateTransformation,
+        SCCSplitDriverLoopsTransformation,
         SCCCollapseTransformation,
         PragmaModelTransformation
     )
@@ -356,6 +359,7 @@ SCCSStackPipeline = partial(
         RemoveUnusedVarTransformation,
         SCCAnnotateTransformation,
         TemporariesPoolAllocatorTransformation,
+        SCCSplitDriverLoopsTransformation,
         SCCCollapseTransformation,
         PragmaModelTransformation
     )
@@ -455,6 +459,7 @@ SCCSStackFtrPtrPipeline = partial(
         RemoveUnusedVarTransformation,
         SCCAnnotateTransformation,
         FtrPtrStackTransformation,
+        SCCSplitDriverLoopsTransformation,
         SCCCollapseTransformation,
         PragmaModelTransformation
     )
@@ -557,6 +562,7 @@ SCCSStackDirectIdxPipeline = partial(
         RemoveUnusedVarTransformation,
         SCCAnnotateTransformation,
         DirectIdxStackTransformation,
+        SCCSplitDriverLoopsTransformation,
         SCCCollapseTransformation,
         PragmaModelTransformation
     )
@@ -660,6 +666,7 @@ SCCSRawStackPipeline = partial(
         SCCSeqRevectorTransformation,
         SCCAnnotateTransformation,
         TemporariesRawStackTransformation,
+        SCCSplitDriverLoopsTransformation,
         SCCCollapseTransformation,
         PragmaModelTransformation
     )
@@ -762,6 +769,7 @@ SCCSEcStackPipeline = partial(
         RemoveUnusedVarTransformation,
         SCCAnnotateTransformation,
         EcstackPoolAllocatorTransformation,
+        SCCSplitDriverLoopsTransformation,
         SCCCollapseTransformation,
         PragmaModelTransformation
     )

@@ -35,10 +35,19 @@ class SCCCollapseTransformation(Transformation):
     ----------
     collapse_gang_vector : bool, optional
         Enable collapsing eligible pairs, by default False.
+    collapse_data_sharing : bool, optional
+        Also collapse gang loops with ``private`` and ``firstprivate`` clauses and keep them on
+        the combined annotation, by default False. The caller guarantees that variables shared
+        between the gang and vector levels are listed (see :any:`SCCSplitDriverLoopsTransformation`).
+    collapse_strided_gang : bool, optional
+        Also collapse gang loops with a loop-invariant non-unit step, such as
+        ``DO JKGLO=1,NGPTOT,NPROMA``, by default False.
     """
 
-    def __init__(self, collapse_gang_vector=False):
+    def __init__(self, collapse_gang_vector=False, collapse_data_sharing=False, collapse_strided_gang=False):
         self.collapse_gang_vector = collapse_gang_vector
+        self.collapse_data_sharing = collapse_data_sharing
+        self.collapse_strided_gang = collapse_strided_gang
 
     @staticmethod
     def loop_parameters(pragmas, command, level, allowed):
@@ -60,14 +69,15 @@ class SCCCollapseTransformation(Transformation):
         return params
 
     @classmethod
-    def check_candidate(cls, outer):
+    def check_candidate(cls, outer, data_sharing=False, strided_gang=False):
         """
         Return the inner vector loop and a rejection reason for a gang loop.
 
         The reason is None on success. This check requires attached loop
         pragmas and dataflow analysis and does not modify the loop nest.
         """
-        if cls.loop_parameters(outer.pragma, 'loop', 'gang', {'gang', 'vlength', 'async'}) is None:
+        gang_clauses = {'gang', 'vlength', 'async'} | ({'private', 'firstprivate'} if data_sharing else set())
+        if cls.loop_parameters(outer.pragma, 'loop', 'gang', gang_clauses) is None:
             return None, 'unsupported gang-loop annotations or clauses'
         if outer.pragma_post and cls.loop_parameters(outer.pragma_post, 'end-loop', 'gang', {'gang'}) is None:
             return None, 'unsupported gang-loop end annotations'
@@ -84,7 +94,9 @@ class SCCCollapseTransformation(Transformation):
         if outer.variable == inner.variable:
             return None, 'associated loops use the same induction variable'
         for loop in (outer, inner):
-            if loop.loop_label or not loop.has_end_do or loop.bounds.step not in (None, 1):
+            unit_step = loop.bounds.step in (None, 1)
+            strided = strided_gang and loop is outer and not FindInlineCalls().visit(loop.bounds.step)
+            if loop.loop_label or not loop.has_end_do or not (unit_step or strided):
                 return None, 'associated loops must be structured unit-step loops'
             if FindInlineCalls().visit(loop.bounds):
                 return None, 'calls in associated loop bounds are unsupported'
@@ -120,7 +132,9 @@ class SCCCollapseTransformation(Transformation):
                                     and 'gang' in get_pragma_command_and_parameters(p)[1]]
                     if not gang_pragmas or 'collapse' in get_pragma_command_and_parameters(gang_pragmas[0])[1]:
                         continue
-                    inner, reason = self.check_candidate(outer)
+                    inner, reason = self.check_candidate(
+                        outer, data_sharing=self.collapse_data_sharing, strided_gang=self.collapse_strided_gang
+                    )
                     if reason:
                         info(f'[Loki-SCC::Collapse] Skipping {routine.name}/{outer.variable}: {reason}')
                     else:
