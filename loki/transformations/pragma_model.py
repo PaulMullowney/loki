@@ -10,6 +10,7 @@ from loki.batch import Transformation, ProcedureItem, ModuleItem
 from loki.ir import (
     FindNodes, Pragma, Transformer, get_pragma_command_and_parameters
 )
+from loki.types import DerivedType
 
 __all__ = ['PragmaModelTransformation']
 
@@ -242,6 +243,10 @@ class OpenMPOffloadPragmaMapper(GenericPragmaMapper):
             content += f' map(to: {param_in})'
         if param_create := parameters.get('create'):
             content += f' map(alloc: {param_create})'
+        # Attaching a pointer member whose target is already present: map(alloc:)
+        # attaches it in the parent's device copy without transferring data
+        if param_attach := parameters.get('attach'):
+            content += f' map(alloc: {param_attach})'
         if content:
             return Pragma(keyword='omp', content=f'target enter data{content}')
         return self.default_retval()
@@ -252,6 +257,9 @@ class OpenMPOffloadPragmaMapper(GenericPragmaMapper):
             content += f' map(from: {params_out})'
         if params_delete := parameters.get('delete'):
             content += f' map(delete: {params_delete})'
+        # Undo the map(alloc:) of an attach without freeing the target's device copy
+        if param_detach := parameters.get('detach'):
+            content += f' map(release: {param_detach})'
         if content:
             return Pragma(keyword='omp', content=f'target exit data{content}')
         return self.default_retval()
@@ -286,22 +294,33 @@ class OpenMPOffloadPragmaMapper(GenericPragmaMapper):
             return Pragma(keyword='omp', content='declare target')
         return self.default_retval()
 
+    @staticmethod
+    def _data_sharing_clauses(parameters, with_reduction=False):
+        clauses = ''
+        if private_param := parameters.get('private'):
+            clauses += f' private({private_param})'
+        if fprivate_param := parameters.get('firstprivate'):
+            clauses += f' firstprivate({fprivate_param})'
+        if with_reduction and (reduction_param := parameters.get('reduction')):
+            clauses += f' reduction({reduction_param})'
+        return clauses
+
     def pmap_loop(self, pragma, parameters, **kwargs):
         if 'gang' in parameters and 'vector' in parameters:
             collapse_param = parameters.get('collapse')
             collapse = f' collapse({collapse_param})' if collapse_param else ''
             vlength_param = parameters.get('vlength')
             vlength = f' thread_limit({vlength_param})' if vlength_param and self.emit_thread_limit else ''
-            return Pragma(keyword='omp', content=f'target teams distribute parallel do{collapse}{vlength}')
+            clauses = self._data_sharing_clauses(parameters)
+            return Pragma(keyword='omp', content=f'target teams distribute parallel do{collapse}{vlength}{clauses}')
         if 'vector' in parameters:
-            # TODO: private and reduction clause?
-            content = 'parallel do'
-            return Pragma(keyword='omp', content=content)
+            clauses = self._data_sharing_clauses(parameters, with_reduction=True)
+            return Pragma(keyword='omp', content=f'parallel do{clauses}')
         if 'gang' in parameters:
-            # TODO: private clause?
             vlength_param = parameters.get('vlength')
             vlength = f' thread_limit({vlength_param})' if vlength_param and self.emit_thread_limit else ''
-            content = f'target teams distribute{vlength}'
+            clauses = self._data_sharing_clauses(parameters)
+            content = f'target teams distribute{vlength}{clauses}'
             return Pragma(keyword='omp', content=content)
         return self.default_retval()
 
@@ -365,14 +384,24 @@ class PragmaModelTransformation(Transformation):
         Emit ``thread_limit`` clauses from generic ``vlength`` metadata for
         ``'omp-gpu'``, by default True. Applies to ordinary and combined
         gang/vector loops. Other programming models are unaffected.
+    shallow_mappers : bool, optional
+        For ``'omp-gpu'``, declare a default mapper that maps only the
+        derived type itself for every derived type declared in a routine
+        that contains ``target`` constructs, by default False. Without it
+        the compiler's implicit default mappers map all allocatable and
+        pointer components recursively on every construct, whereas the
+        OpenACC version of the code (shallow copies plus explicit member
+        attaches) expects the components to be present already.
     """
     item_filter = (ProcedureItem, ModuleItem)
 
-    def __init__(self, directive=False, keep_loki_pragmas=True, emit_thread_limit=True):
+    def __init__(self, directive=False, keep_loki_pragmas=True, emit_thread_limit=True,
+                 shallow_mappers=False):
         assert directive in [False, 'openacc', 'omp-gpu', 'openmp']
         self.directive = directive
         self.keep_loki_pragmas = keep_loki_pragmas
         self.emit_thread_limit = emit_thread_limit
+        self.shallow_mappers = shallow_mappers
         pmapper_cls_map = {
             'openacc': OpenACCPragmaMapper,
             'omp-gpu': OpenMPOffloadPragmaMapper,
@@ -411,3 +440,34 @@ class PragmaModelTransformation(Transformation):
 
         routine.spec = Transformer(pragma_map).visit(routine.spec)
         routine.body = Transformer(pragma_map).visit(routine.body)
+
+        if self.directive == 'omp-gpu' and self.shallow_mappers:
+            self._declare_shallow_mappers(routine)
+
+    @staticmethod
+    def _declare_shallow_mappers(routine):
+        has_target = any(
+            p.keyword.lower() == 'omp' and p.content.lower().lstrip().startswith('target')
+            for p in FindNodes(Pragma).visit(routine.body)
+        )
+        if not has_target:
+            return
+        declared = {
+            p.content.split('(', 1)[1].split('::', 1)[0].strip().lower()
+            for p in FindNodes(Pragma).visit(routine.spec)
+            if p.keyword.lower() == 'omp' and p.content.lower().startswith('declare mapper(')
+        }
+        type_names = {}
+        for var in routine.variables:
+            dtype = var.type.dtype
+            if not isinstance(dtype, DerivedType) or var.type.polymorphic:
+                continue
+            if dtype.name.lower() not in declared:
+                type_names.setdefault(dtype.name.lower(), dtype.name)
+        if not type_names:
+            return
+        mappers = tuple(
+            Pragma(keyword='omp', content=f'declare mapper({name} :: LOKI_MAPPED) map(tofrom: LOKI_MAPPED)')
+            for _, name in sorted(type_names.items())
+        )
+        routine.spec.append(mappers)

@@ -572,8 +572,12 @@ class Sourcefile:
         """
         Same as :meth:`write` but can be called from a static context.
         """
+        if source[-1] != '\n':
+            source += '\n'
+        # Leave unchanged files untouched so that build systems do not recompile them
+        if path.exists() and path.read_text() == source:
+            detail(f'[Loki::Sourcefile] Unchanged, not writing {path}')
+            return
         detail(f'[Loki::Sourcefile] Writing to {path}')
         with path.open('w') as f:
             f.write(source)
-            if source[-1] != '\n':
-                f.write('\n')

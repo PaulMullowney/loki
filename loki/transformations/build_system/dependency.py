@@ -8,13 +8,15 @@ from pathlib import Path
 
 from loki.backend import fgen
 from loki.batch import Transformation
+from loki.expression import DerivedTypeSymbol
 from loki.ir import (
-    CallStatement, Import, Interface, FindNodes, FindInlineCalls, Transformer
+    CallStatement, Import, Interface, ProcedureDeclaration, TypeDef,
+    FindNodes, FindInlineCalls, Transformer
 )
 from loki.logging import warning
 from loki.module import Module
 from loki.subroutine import Subroutine
-from loki.types import ProcedureType, Scope
+from loki.types import ProcedureType, Scope, SymbolAttributes
 from loki.tools import as_tuple, OrderedSet
 
 
@@ -70,6 +72,11 @@ class DependencyTransformation(Transformation):
         Debug flag to toggle the removal of items (modules, subroutines)
         in the sourcefile that are not part of the scheduler graph.
         Default is ``True``.
+    reuse_derived_types : bool
+        Replace the derived type definitions of renamed kernel modules by
+        imports from the original module, so that the types stay compatible
+        with code that still uses the original module. Requires the original
+        module to be compiled as well. Default is ``False``.
     """
 
     # item_filter = Item
@@ -90,11 +97,12 @@ class DependencyTransformation(Transformation):
     creates_items = True
 
     def __init__(self, suffix, module_suffix=None, include_path=None, replace_ignore_items=True,
-                 remove_inactive_items=True):
+                 remove_inactive_items=True, reuse_derived_types=False):
         self.suffix = suffix
         self.module_suffix = module_suffix
         self.replace_ignore_items = replace_ignore_items
         self.remove_inactive_items = remove_inactive_items
+        self.reuse_derived_types = reuse_derived_types
         self.include_path = None if include_path is None else Path(include_path)
 
     def transform_file(self, sourcefile, **kwargs):
@@ -115,8 +123,10 @@ class DependencyTransformation(Transformation):
 
         # remember/keep track of the module subroutines (even if some of those are removed)
         routines = tuple(routine.name.lower() for routine in module.subroutines)
+        removed_generics = ()
         if role == 'kernel':
             # Change the name of kernel modules
+            orig_name = module.name
             module.name = self.derive_module_name(module.name)
 
             if (item := kwargs.get('item')) and item.name != module.name.lower():
@@ -128,6 +138,8 @@ class DependencyTransformation(Transformation):
                         module.contains.body, f'module {module.name}', **kwargs
                     ),
                 )
+
+            removed_generics = self.rename_module_interfaces(module, routines)
 
         targets = tuple(str(t).lower() for t in as_tuple(kwargs.get('targets')))
         if self.replace_ignore_items and (item := kwargs.get('item')):
@@ -147,6 +159,119 @@ class DependencyTransformation(Transformation):
                 module.private_access_spec, targets=targets, active_nodes=active_nodes,
                 routines=routines
             )
+        if removed_generics:
+            module.public_access_spec = tuple(
+                n for n in module.public_access_spec if n.lower() not in removed_generics
+            )
+            module.private_access_spec = tuple(
+                n for n in module.private_access_spec if n.lower() not in removed_generics
+            )
+
+        # Last, as the scheduler items of the type definitions are still looked up above
+        if role == 'kernel' and self.reuse_derived_types and module.name.lower() != orig_name.lower():
+            self.import_derived_types(module, orig_name)
+
+    def rename_module_interfaces(self, module, routines):
+        """
+        Update the ``MODULE PROCEDURE`` lists of generic interfaces in a kernel module
+
+        Procedures of the module that are still present are renamed with :attr:`suffix`
+        and those that have been removed are dropped. Interfaces left without
+        procedures are removed.
+
+        Parameters
+        ----------
+        module : :any:`Module`
+            The renamed kernel module
+        routines : tuple of str
+            Lower-case names of the module procedures before inactive ones were removed
+
+        Returns
+        -------
+        tuple of str
+            Lower-case names of the generic interfaces that were removed
+        """
+        if not module.spec:
+            return ()
+
+        suffix = self.suffix.lower()
+
+        def _base(name):
+            name = name.lower()
+            return name[:-len(suffix)] if name.endswith(suffix) else name
+
+        active = {_base(r.name) for r in module.subroutines}
+        module_routines = {_base(r) for r in routines}
+
+        intf_map = {}
+        removed = ()
+        for intf in FindNodes(Interface).visit(module.spec):
+            if not intf.spec:
+                continue
+            body = ()
+            n_procs = 0
+            for node in intf.body:
+                if isinstance(node, ProcedureDeclaration) and node.module:
+                    symbols = tuple(
+                        s.clone(name=f'{_base(s.name)}{self.suffix}')
+                        if _base(s.name) in module_routines else s
+                        for s in node.symbols
+                        if _base(s.name) not in module_routines or _base(s.name) in active
+                    )
+                    if not symbols:
+                        continue
+                    n_procs += len(symbols)
+                    node = node.clone(symbols=symbols)
+                body += (node,)
+            if n_procs:
+                intf_map[intf] = intf.clone(body=body)
+            else:
+                intf_map[intf] = None
+                removed += (str(intf.spec).lower(),)
+
+        if intf_map:
+            module.spec = Transformer(intf_map).visit(module.spec)
+        return removed
+
+    def import_derived_types(self, module, orig_name):
+        """
+        Replace the derived type definitions of a renamed kernel module by an
+        import of these types from the original module :data:`orig_name`
+
+        Types that the original module does not make public are kept.
+        """
+        if not module.spec:
+            return
+
+        public = {n.lower() for n in module.public_access_spec}
+        private = {n.lower() for n in module.private_access_spec}
+        default_private = module.default_access_spec == 'private'
+
+        def _is_public(typedef):
+            name = typedef.name.lower()
+            if name in private:
+                return False
+            return name in public or not default_private
+
+        typedefs = tuple(
+            node for node in module.spec.body
+            if isinstance(node, TypeDef) and _is_public(node)
+        )
+        if not typedefs:
+            return
+
+        symbols = tuple(
+            DerivedTypeSymbol(name=td.name, scope=module, type=SymbolAttributes(td.dtype, imported=True))
+            for td in typedefs
+        )
+        imp = Import(module=orig_name, symbols=symbols)
+
+        body = tuple(node for node in module.spec.body if node not in typedefs)
+        last_import = max(
+            (i for i, node in enumerate(body) if isinstance(node, Import)), default=-1
+        )
+        body = body[:last_import + 1] + (imp,) + body[last_import + 1:]
+        module.spec = module.spec.clone(body=body)
 
     def transform_subroutine(self, routine, **kwargs):
         """

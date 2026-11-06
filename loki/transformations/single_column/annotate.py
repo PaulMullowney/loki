@@ -283,10 +283,12 @@ class SCCAnnotateTransformation(Transformation):
         loop_vars = FindVariables(unique=True).visit(loop)
         arrays = [v for v in loop_vars if isinstance(v, sym.Array)]
         arrays = [v for v in arrays if not v.type.intent]
-        arrays = [v for v in arrays if not v.type.pointer]
+        arrays = [v for v in arrays if not (v.type.pointer or v.type.allocatable)]
+        arrays = [v for v in arrays if not getattr(v, 'parent', None)]
         arrays = [v for v in arrays if not v.name_parts[0].lower() in acc_vars]
         arrays = [v for v in arrays if not any(d in sizes for d in as_tuple(v.shape))]
         private_sym = arrays
+        fprivate_sym = []
 
         if self.privatise_derived_types:
             # Derived-types are classified as "aggregate variables" in the OpenACC and OpenMP offload
@@ -300,17 +302,22 @@ class SCCAnnotateTransformation(Transformation):
             # only privatise derived-type parent
             private_sym = [v for v in private_sym if not v.name_parts[0].lower() in structs]
 
-            if (dynamic_structs := [v.name for v in structs if (v.type.pointer or v.type.allocatable)]):
-                warning(f'[Loki-SCC::Annotate] dynamically allocated structs are being privatised: {dynamic_structs}')
+            # Pointer and allocatable structs keep their implicit data mapping: privatising
+            # them would copy host addresses (or unallocated descriptors) into the region.
+            structs = [v for v in structs if not (v.type.pointer or v.type.allocatable)]
 
-            # Filter out arrays that are explicitly allocated with block dimension
-            private_sym +=  [
+            # Filter out arrays that are explicitly allocated with block dimension.
+            # Structs are firstprivate so that values (and pointer associations)
+            # set before the driver loop remain defined inside it.
+            fprivate_sym = [
                 v for v in structs
                 if not any(d in sizes for d in as_tuple(getattr(v, 'shape', [])))
             ]
 
         private_vars = ', '.join(dict.fromkeys(v.name for v in private_sym))
         private_clause = '' if not private_vars else f' private({private_vars})'
+        fprivate_vars = ', '.join(dict.fromkeys(v.name for v in fprivate_sym))
+        private_clause += '' if not fprivate_vars else f' firstprivate({fprivate_vars})'
 
         for pragma in as_tuple(loop.pragma):
             if is_loki_pragma(pragma, starts_with='loop driver'):

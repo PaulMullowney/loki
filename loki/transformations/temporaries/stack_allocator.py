@@ -544,6 +544,13 @@ class BaseStackTransformation(Transformation):
                         if expr_map:
                             expr_map = recursive_expression_map_update(expr_map)
                             successor_stack_size = SubstituteExpressions(expr_map).visit(successor_stack_size)
+                        # Actual arguments can be module symbols of this routine (e.g. a PARAMETER
+                        # passed as an array bound); the driver has to import them for the stack size
+                        if item:
+                            for var in FindVariables().visit(successor_stack_size):
+                                if var.name in routine.import_map:
+                                    item.trafo_data[self._key]['kind_imports'][var] = \
+                                        routine.import_map[var.name].module.lower()
                         stack_dict.setdefault(dtype, {})
                         stack_dict[dtype].setdefault(kind, []).append(successor_stack_size)
 

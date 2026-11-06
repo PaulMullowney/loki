@@ -30,11 +30,28 @@ class SCCHoistTemporaryArraysTransformation(HoistVariablesTransformation):
     block_dim : :any:`Dimension`
         :any:`Dimension` object to define the blocking dimension
         to use for hoisted array arguments on the driver side.
+    hoist_pass_first_element : bool, optional
+        Pass each hoisted array to the kernel by its first element in the block,
+        ``V(lb1, ..., lbN, IBL)``, instead of as the section ``V(:, ..., :, IBL)``.
+        The kernel dummies are explicit-shape, so sequence association passes the
+        same contiguous block, but the caller does not build an array descriptor
+        per argument; in offloaded drivers with hundreds of hoisted arguments these
+        descriptors can exceed the GPU stack. Default is ``False``.
     """
 
-    def __init__(self, block_dim=None, **kwargs):
+    def __init__(self, block_dim=None, hoist_pass_first_element=False, **kwargs):
         self.block_dim = block_dim
+        self.hoist_pass_first_element = hoist_pass_first_element
         super().__init__(**kwargs)
+
+    def _block_slice(self, v, idx_var):
+        if self.hoist_pass_first_element:
+            starts = tuple(
+                d.lower if isinstance(d, sym.RangeIndex) and d.lower is not None else sym.IntLiteral(1)
+                for d in v.dimensions
+            )
+            return v.clone(dimensions=starts + (idx_var,))
+        return v.clone(dimensions=tuple(sym.RangeIndex((None, None)) for _ in v.dimensions) + (idx_var,))
 
     def driver_variable_declaration(self, routine, variables):
         """
@@ -102,14 +119,8 @@ class SCCHoistTemporaryArraysTransformation(HoistVariablesTransformation):
             )
         idx_var = get_integer_variable(routine, self.block_dim.index)
         if self.as_kwarguments:
-            new_kwargs = tuple(
-                (a.name, v.clone(dimensions=tuple(sym.RangeIndex((None, None))
-                for _ in v.dimensions) + (idx_var,))) for (a, v) in variables
-            )
+            new_kwargs = tuple((a.name, self._block_slice(v, idx_var)) for (a, v) in variables)
             kwarguments = call.kwarguments if call.kwarguments is not None else ()
             return call.clone(kwarguments=kwarguments + new_kwargs)
-        new_args = tuple(
-            v.clone(dimensions=tuple(sym.RangeIndex((None, None)) for _ in v.dimensions) + (idx_var,))
-            for v in variables
-        )
+        new_args = tuple(self._block_slice(v, idx_var) for v in variables)
         return call.clone(arguments=call.arguments + new_args)
