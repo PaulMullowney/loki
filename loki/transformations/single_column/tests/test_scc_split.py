@@ -136,3 +136,25 @@ def test_scc_split_hoist_invariant_setup(frontend, tmp_path):
         assert not any('ilev' in fgen(o).lower().split('if (jl')[0] and 'ilev =' in fgen(o).lower() for o in outers)
     host = [n for n in routine.body.body if isinstance(n, ir.Conditional)]
     assert any('ilev = 0' in fgen(c).lower() for c in host)
+
+
+@pytest.mark.parametrize('frontend', available_frontends())
+def test_scc_split_hoist_invariant_setup_after_statements(frontend, tmp_path):
+    """Invariant setup after other statements of the vector loop is hoisted too, unless its inputs
+    are written earlier in the loop body."""
+    setup = '      if (ldflag) then\n        ilev = 0\n      else\n        ilev = nlev\n      end if\n'
+    source = DRIVER.replace('      ztmp = 2. * b(jl, ibl)\n', '      z(jl, ibl) = 0.\n' + setup + '      ztmp = 2. * b(jl, ibl)\n')
+    source = source.replace('b(jl, ibl) = b(jl, ibl) + a(jl, 1, ibl)', 'b(jl, ibl) = b(jl, ibl) + a(jl, ilev, ibl)')
+    source = source.replace('  real :: ztmp\n', '  real :: ztmp\n  integer :: ilev\n')
+    routine = Subroutine.from_source(source, frontend=frontend, xmods=[tmp_path])
+    SCCSplitDriverLoopsTransformation(split_driver_loops=True, horizontal=HORIZONTAL).apply(routine, role='driver')
+    host = [n for n in routine.body.body if isinstance(n, ir.Conditional)]
+    assert any('ilev = 0' in fgen(c).lower() for c in host)
+
+    # The setup reads a scalar that the loop body sets before it: not hoisted, the loop is not split
+    source = source.replace('        ilev = nlev\n', '        ilev = nlev + int(ztmp)\n')
+    source = source.replace('      z(jl, ibl) = 0.\n', '      ztmp = 1.\n')
+    routine = Subroutine.from_source(source, frontend=frontend, xmods=[tmp_path])
+    before = fgen(routine)
+    SCCSplitDriverLoopsTransformation(split_driver_loops=True, horizontal=HORIZONTAL).apply(routine, role='driver')
+    assert fgen(routine) == before

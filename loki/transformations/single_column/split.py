@@ -244,18 +244,36 @@ class SCCSplitDriverLoopsTransformation(Transformation):
         return not ({v.name_parts[0].lower() for v in variables} & excluded)
 
     def _invariant_prefix(self, loop, ctx):
-        """Split the leading block- and column-invariant scalar setup off a vector-loop body."""
+        """Split the block- and column-invariant scalar setup off a vector-loop body.
+
+        A setup statement is hoisted if no statement before it in the body writes its inputs
+        or references the scalars it sets, so it can run once on the host before the kernel."""
         excluded = ctx['block_names'] | {loop.variable.name.lower()}
-        body = list(loop.body)
+        body = []
         hoisted = []
-        while body and (isinstance(body[0], (ir.Comment, ir.CommentBlock))
-                        or self._is_invariant_setup(body[0], excluded)):
-            node = body.pop(0)
-            if not isinstance(node, (ir.Comment, ir.CommentBlock)):
-                hoisted.append(node)
+        for node in loop.body:
+            if isinstance(node, (ir.Comment, ir.CommentBlock)):
+                if body:
+                    body.append(node)
+                continue
+            if self._is_invariant_setup(node, excluded):
+                names = {v.name_parts[0].lower() for v in FindVariables().visit(node)}
+                targets = {a.lhs.name.lower() for a in FindNodes(ir.Assignment).visit(node)}
+                earlier = {v.name_parts[0].lower() for v in FindVariables().visit(tuple(body))}
+                written = {a.lhs.name_parts[0].lower() for a in FindNodes(ir.Assignment).visit(tuple(body))}
+                for call in FindNodes(ir.CallStatement).visit(tuple(body)):
+                    written |= {v.name_parts[0].lower() for v in FindVariables().visit(call.arguments)}
+                    written |= {v.name_parts[0].lower() for v in FindVariables().visit(tuple(a for _, a in call.kwarguments))}
+                if not (names & written) and not (targets & earlier):
+                    hoisted.append(node)
+                    continue
+            body.append(node)
         # Scalars set by the hoisted code must not be modified later in the loop body
         targets = {a.lhs.name.lower() for a in FindNodes(ir.Assignment).visit(tuple(hoisted))}
         rewritten = {a.lhs.name_parts[0].lower() for a in FindNodes(ir.Assignment).visit(tuple(body))}
+        for call in FindNodes(ir.CallStatement).visit(tuple(body)):
+            rewritten |= {v.name_parts[0].lower() for v in FindVariables().visit(call.arguments)}
+            rewritten |= {v.name_parts[0].lower() for v in FindVariables().visit(tuple(a for _, a in call.kwarguments))}
         if targets & rewritten:
             return [], loop.body
         return hoisted, tuple(body)
