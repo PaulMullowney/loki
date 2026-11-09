@@ -19,6 +19,7 @@ from loki.transformations.single_column.base import SCCBaseTransformation
 from loki.transformations.single_column.annotate import SCCAnnotateTransformation
 from loki.transformations.single_column.collapse import SCCCollapseTransformation
 from loki.transformations.single_column.split import SCCSplitDriverLoopsTransformation
+from loki.transformations.single_column.persist import SCCPersistentDescriptorsTransformation
 from loki.transformations.single_column.demote import SCCDemoteTransformation
 from loki.transformations.single_column.hoist import SCCHoistTemporaryArraysTransformation
 from loki.transformations.single_column.devector import SCCDevectorTransformation
@@ -135,6 +136,7 @@ SCCSVectorPipeline = partial(
         SCCAnnotateTransformation,
         SCCSplitDriverLoopsTransformation,
         SCCCollapseTransformation,
+        SCCPersistentDescriptorsTransformation,
         PragmaModelTransformation
     )
 )
@@ -256,6 +258,7 @@ SCCSHoistPipeline = partial(
         SCCAnnotateTransformation,
         SCCSplitDriverLoopsTransformation,
         SCCCollapseTransformation,
+        SCCPersistentDescriptorsTransformation,
         PragmaModelTransformation
     )
 )
@@ -361,6 +364,7 @@ SCCSStackPipeline = partial(
         TemporariesPoolAllocatorTransformation,
         SCCSplitDriverLoopsTransformation,
         SCCCollapseTransformation,
+        SCCPersistentDescriptorsTransformation,
         PragmaModelTransformation
     )
 )
@@ -461,6 +465,7 @@ SCCSStackFtrPtrPipeline = partial(
         FtrPtrStackTransformation,
         SCCSplitDriverLoopsTransformation,
         SCCCollapseTransformation,
+        SCCPersistentDescriptorsTransformation,
         PragmaModelTransformation
     )
 )
@@ -564,6 +569,7 @@ SCCSStackDirectIdxPipeline = partial(
         DirectIdxStackTransformation,
         SCCSplitDriverLoopsTransformation,
         SCCCollapseTransformation,
+        SCCPersistentDescriptorsTransformation,
         PragmaModelTransformation
     )
 )
@@ -668,6 +674,7 @@ SCCSRawStackPipeline = partial(
         TemporariesRawStackTransformation,
         SCCSplitDriverLoopsTransformation,
         SCCCollapseTransformation,
+        SCCPersistentDescriptorsTransformation,
         PragmaModelTransformation
     )
 )
@@ -771,6 +778,7 @@ SCCSEcStackPipeline = partial(
         EcstackPoolAllocatorTransformation,
         SCCSplitDriverLoopsTransformation,
         SCCCollapseTransformation,
+        SCCPersistentDescriptorsTransformation,
         PragmaModelTransformation
     )
 )
