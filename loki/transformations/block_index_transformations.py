@@ -4,6 +4,8 @@
 # granted to it by virtue of its status as an intergovernmental organisation
 # nor does it submit to any jurisdiction.
 
+import re
+
 from loki.batch import Transformation, ProcedureItem
 from loki.ir import (
     nodes as ir, FindNodes, Transformer, pragmas_attached,
@@ -25,7 +27,8 @@ from loki.transformations.utilities import (
 )
 
 __all__ = ['BlockViewToFieldViewTransformation', 'InjectBlockIndexTransformation',
-        'LowerBlockIndexTransformation', 'LowerBlockLoopTransformation']
+        'LowerBlockIndexTransformation', 'LowerBlockLoopTransformation',
+        'ContiguousFieldSliceArgumentTransformation']
 
 class BlockViewToFieldViewTransformation(Transformation):
     """
@@ -772,3 +775,128 @@ class LowerBlockLoopTransformation(Transformation):
                                 additional_kwargs[call.routine.name])
                     driver_loop_map[loop] = loop.body
                 routine.body = Transformer(driver_loop_map).visit(routine.body)
+
+
+class ContiguousFieldSliceArgumentTransformation(Transformation):
+    """
+    Pass per-block slices of non-``CONTIGUOUS`` pointers through ``CONTIGUOUS`` pointers.
+
+    :any:`BlockViewToFieldViewTransformation` and :any:`InjectBlockIndexTransformation`
+    turn view-pointer arguments into slices such as ``YDVARS%T%T0_FIELD(:,:,KBL)``, and
+    drivers pass slices of full-field device pointers such as ``STATE_T0_T(:,:,IBL)``.
+    These pointers cannot be declared ``CONTIGUOUS``, as FIELD API stack members are
+    strided views of their owner, so the compiler checks every such actual at runtime and
+    copies it in when the check fails. In device code that copy needs the Fortran runtime
+    allocator, which is not available there. The leading dimensions of a block are always
+    contiguous, however, so each slice is aimed at a local ``POINTER, CONTIGUOUS`` array
+    immediately before the call and that is passed instead.
+
+    In kernels the whole body is processed. In drivers only calls inside OpenMP ``target``
+    loops are, and the local pointers are added to the loop's ``private`` clause.
+    """
+
+    item_filter = (ProcedureItem,)
+
+    def __init__(self, suffix='_FIELD', prefix='ZLCONTIG_'):
+        self.suffix = suffix.upper()
+        self.prefix = prefix
+
+    def _is_block_slice(self, arg, role):
+        if not isinstance(arg, Array):
+            return False
+        if arg.parent:
+            if not arg.name_parts[-1].upper().endswith(self.suffix):
+                return False
+        elif role != 'driver':
+            return False
+        if not getattr(arg.type, 'pointer', False) or getattr(arg.type, 'contiguous', False):
+            return False
+        if not isinstance(arg.type.dtype, BasicType):
+            return False
+        dims = as_tuple(arg.dimensions)
+        if not dims or not isinstance(dims[0], RangeIndex) or isinstance(dims[-1], RangeIndex):
+            return False
+        # Full ranges in the leading dimensions, scalar indices in the trailing ones
+        nrange = 0
+        for d in dims:
+            if not isinstance(d, RangeIndex):
+                break
+            if d.lower is not None or d.upper is not None or d.step is not None:
+                return False
+            nrange += 1
+        return not any(isinstance(d, RangeIndex) for d in dims[nrange:])
+
+    def _process_calls(self, node, routine, role, pointers):
+        """Rewrite the calls in ``node``; return the new node and the pointers it uses."""
+        call_map = {}
+        used = {}
+        for call in FindNodes(ir.CallStatement).visit(node):
+            assignments = []
+            arg_map = {}
+            for arg in as_tuple(call.arguments) + tuple(a for _, a in as_tuple(call.kwarguments)):
+                if arg in arg_map or not self._is_block_slice(arg, role):
+                    continue
+                key = str(arg).upper()
+                if key not in pointers:
+                    rank = sum(isinstance(d, RangeIndex) for d in arg.dimensions)
+                    shape = (RangeIndex((None, None)),) * rank
+                    _type = SymbolAttributes(arg.type.dtype, kind=arg.type.kind, pointer=True,
+                                             contiguous=True, shape=shape)
+                    pointers[key] = Variable(name=f'{self.prefix}{len(pointers)+1}', type=_type,
+                                             dimensions=shape, scope=routine)
+                ptr = pointers[key].clone(dimensions=None)
+                used[ptr.name.upper()] = ptr
+                assignments.append(ir.Assignment(lhs=ptr, rhs=arg, ptr=True))
+                arg_map[arg] = ptr
+            if arg_map:
+                arguments = tuple(arg_map.get(a, a) for a in as_tuple(call.arguments))
+                kwarguments = tuple((k, arg_map.get(a, a)) for k, a in as_tuple(call.kwarguments))
+                call_map[call] = tuple(assignments) + (call.clone(arguments=arguments, kwarguments=kwarguments),)
+        if call_map:
+            node = Transformer(call_map).visit(node)
+        return node, used
+
+    @staticmethod
+    def _add_private(pragma, names):
+        content = pragma.content
+        m = re.search(r'(?<![a-z_])private\(\s*', content, re.I)
+        if m:
+            content = content[:m.end()] + ', '.join(names) + ', ' + content[m.end():]
+        else:
+            content = content + ' private( ' + ', '.join(names) + ' )'
+        return pragma.clone(content=content)
+
+    def transform_subroutine(self, routine, **kwargs):
+        role = kwargs.get('role')
+        if role not in ('kernel', 'driver'):
+            return
+
+        pointers = {}
+        if role == 'kernel':
+            routine.body, _ = self._process_calls(routine.body, routine, role, pointers)
+        else:
+            with pragmas_attached(routine, ir.Loop):
+                loop_map = {}
+                for loop in FindNodes(ir.Loop).visit(routine.body):
+                    pragmas = [p for p in as_tuple(loop.pragma)
+                               if p.keyword.lower() == 'omp' and 'target' in p.content.lower()]
+                    if not pragmas:
+                        continue
+                    body, used = self._process_calls(loop.body, routine, role, pointers)
+                    if not used:
+                        continue
+                    new_pragma = tuple(self._add_private(p, list(used)) if p is pragmas[0] else p
+                                       for p in as_tuple(loop.pragma))
+                    loop_map[loop] = loop.clone(body=body, pragma=new_pragma)
+                if loop_map:
+                    routine.body = Transformer(loop_map).visit(routine.body)
+
+        if pointers:
+            routine.variables += tuple(pointers.values())
+            # The kind of a component need not be imported where the component is used
+            known = {str(s).upper() for s in routine.imported_symbols} | {v.upper() for v in routine.variable_map}
+            kinds = {str(p.type.kind).upper() for p in pointers.values() if p.type.kind is not None}
+            missing = sorted(k for k in kinds if k not in known and k.startswith('JP'))
+            if missing:
+                symbols = tuple(Variable(name=k, scope=routine) for k in missing)
+                routine.spec.prepend(ir.Import(module='PARKIND1', symbols=symbols))
